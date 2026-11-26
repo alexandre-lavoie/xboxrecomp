@@ -46,10 +46,12 @@
 #include <time.h>
 
 #include "video_player.h"
+#include "pvideo_scanout.h"
 #include "keyboard_sdl.h"     /* src/input: keys into the pad stand-in */
 #include "xinput_xbox.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
+extern volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
 
 #define FB_W 640u
 #define FB_H 480u
@@ -75,6 +77,69 @@ static Uint32          s_frame_event;        /* wakes the main loop */
 static volatile int    s_wake_pending;
 static volatile int    s_in_present;         /* executor inside Present */
 static volatile uint32_t s_fb_va, s_fb_pitch; /* AvSetDisplayMode surface */
+
+/* PVIDEO does not submit framebuffer flips. Poll its two overlay banks from
+ * the SDL main thread, copy a complete YUY2 frame, and clear the consumed bit
+ * just as scanout hardware does. The Windows presenter gets the same behavior
+ * through nv2a_hook_pvideo_snapshot/consume; POSIX titles write the plain
+ * mapped aperture directly. */
+static uint32_t *s_pvideo_rgb;
+static int s_pvideo_active;
+
+static int pvideo_poll(void)
+{
+    volatile uint32_t *mapped = xbox_Nv2aRegPtr(0x8000u);
+    uint32_t regs[0x1000 / 4];
+    unsigned bank, i;
+
+    if (!mapped)
+        return 0;
+    for (i = 0; i < 0x1000 / 4; i++)
+        regs[i] = mapped[i];
+
+    if ((regs[NV_PVIDEO_STOP / 4] & 1u) ||
+        (s_pvideo_active &&
+         regs[NV_PVIDEO_SIZE_IN / 4] == UINT32_MAX &&
+         regs[(NV_PVIDEO_SIZE_IN + 4) / 4] == UINT32_MAX)) {
+        s_pvideo_active = 0;
+        return 0;
+    }
+
+    for (bank = 0; bank < 2; bank++) {
+        uint32_t bit = 1u << (bank * 4u);
+        uint64_t physical, bytes;
+        unsigned pitch, height;
+        const uint8_t *source;
+
+        if (!(regs[NV_PVIDEO_BUFFER / 4] & bit))
+            continue;
+        physical = (uint64_t)regs[(NV_PVIDEO_BASE + bank * 4) / 4] +
+                   regs[(NV_PVIDEO_OFFSET + bank * 4) / 4];
+        pitch = regs[(NV_PVIDEO_FORMAT + bank * 4) / 4] &
+                NV_PVIDEO_FORMAT_PITCH;
+        height = (regs[(NV_PVIDEO_SIZE_IN + bank * 4) / 4] >> 16) & 0x7ff;
+        bytes = (uint64_t)pitch * height;
+        if (!bytes || physical + bytes > (64u << 20))
+            continue;
+
+        if (!s_pvideo_rgb) {
+            s_pvideo_rgb = (uint32_t *)calloc((size_t)FB_W * FB_H,
+                                              sizeof(uint32_t));
+            if (!s_pvideo_rgb)
+                return s_pvideo_active;
+        }
+        source = (const uint8_t *)((uintptr_t)(0x80000000u + (uint32_t)physical)
+                                   + xbox_GetMemoryOffset());
+        if (pvideo_scanout(regs, source, (size_t)bytes, s_pvideo_rgb,
+                           FB_W, FB_H, bank)) {
+            s_pvideo_active = 1;
+            /* Preserve a concurrently submitted bank while returning this one. */
+            __atomic_fetch_and(&mapped[NV_PVIDEO_BUFFER / 4], ~bit,
+                               __ATOMIC_SEQ_CST);
+        }
+    }
+    return s_pvideo_active;
+}
 
 /* Counted at the flip, read once a second for the title bar. */
 static uint64_t s_flips;
@@ -358,10 +423,10 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         const uint8_t *px = NULL;
         uint32_t bpp = 0, pitch = 0;
 
-        /* Before the first flip, poll at the display rate: the window then
-         * reads the display surface itself. After, the flip's event wakes
-         * the loop. */
-        if (SDL_WaitEventTimeout(&ev, shown_seq ? 100 : 16)) {
+        /* Poll at display rate even after framebuffer flips: PVIDEO overlay
+         * frames do not generate those events and their producer waits for
+         * scanout to release each bank. */
+        if (SDL_WaitEventTimeout(&ev, 16)) {
             do {
                 /* Keys for the pad stand-in, and the window events that
                  * release them; it only reads the event. */
@@ -399,6 +464,11 @@ int xbox_HostWindowMain(int (*guest_main)(void))
             pitch = s_fb_pitch;
             if (bpp == 2 || bpp == 4)
                 px = (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
+        }
+        if (pvideo_poll()) {
+            px = (const uint8_t *)s_pvideo_rgb;
+            bpp = 4;
+            pitch = FB_W * 4;
         }
         if (px) {
             if (!tex || bpp != tex_bpp) {
@@ -452,6 +522,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
      * start calling SDL_GameControllerUpdate while SDL goes down. */
     if (tex)
         SDL_DestroyTexture(tex);
+    free(s_pvideo_rgb);
+    s_pvideo_rgb = NULL;
+    s_pvideo_active = 0;
     SDL_DestroyRenderer(ren);
     SDL_DestroyWindow(win);
     if (!xbox_InputAnyOpen())

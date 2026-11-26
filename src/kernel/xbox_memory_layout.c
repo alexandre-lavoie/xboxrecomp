@@ -531,6 +531,15 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 #define NV2A_PFIFO_REF            0x003248u
 #define NV2A_PFIFO_DMA_SUBROUTINE 0x00324Cu
 
+/* PVIDEO overlay stop handshake. NV_PVIDEO lives at aperture +0x8000;
+ * BUFFER and STOP are offsets 0x700 and 0x704 within that block. STOP is a
+ * command, not stored state: writing bit 0 asks hardware to discard both
+ * pending overlay banks, after which D3D waits for BUFFER to become zero.
+ * The full NV2A model in nv2a_core.c already implements these semantics, but
+ * statically recompiled titles access the plain mapped aperture directly. */
+#define NV2A_PVIDEO_BUFFER 0x008700u
+#define NV2A_PVIDEO_STOP   0x008704u
+
 /*
  * Free-running counters in the MCPX aperture.
  *
@@ -1473,6 +1482,26 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             if ((*r & NV2A_IDLE[i].idle_mask) != NV2A_IDLE[i].idle_mask) {
                 *r |= NV2A_IDLE[i].idle_mask;
             }
+        }
+        {
+            volatile uint32_t *stop =
+                (volatile uint32_t *)((char *)regs + NV2A_PVIDEO_STOP);
+            static int host_window = -1;
+            if (*stop & 1u) {
+                *(volatile uint32_t *)((char *)regs + NV2A_PVIDEO_BUFFER) = 0;
+                *stop = 0;
+            }
+            /* A headless run still has scanout hardware conceptually. With no
+             * SDL presenter to consume overlay banks, acknowledge them here so
+             * movie decoding and title progression do not depend on a window. */
+            if (host_window < 0) {
+                const char *window = getenv("RECOMP_FB_WINDOW");
+                const char *headless = getenv("RECOMP_HEADLESS");
+                host_window = window && *window && *window != '0' &&
+                              !(headless && *headless && *headless != '0');
+            }
+            if (!host_window)
+                *(volatile uint32_t *)((char *)regs + NV2A_PVIDEO_BUFFER) = 0;
         }
         /* DMA_GET used to be set to DMA_PUT here, at the top of the tick,
          * before the scan below had executed anything.
